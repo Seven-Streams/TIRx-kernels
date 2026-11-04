@@ -18,10 +18,27 @@ _FORBIDDEN_SCOPE_ROOTS = ("global", "shared")
 _ADDRESS_OF_OP = "tirx.address_of"
 _FUNC_CALL_OP = "tirx.cuda.func_call"
 _SETMAXNREG_OP = "tirx.ptx.setmaxnreg"
+# Operator-name and type-key roots of the core IR. codegen and the analysis tools
+# understand only these; anything else is an IR extension that its own pass must
+# lower first.
+_CORE_NAMESPACES = ("ir", "prim", "tirx")
+_EXTENSION_HINT = (
+    "lower IR-extension constructs with the extension's pass, "
+    "@txl.kernel(passes=[...]), before the contract check"
+)
 
 
 def _is_forbidden_scope(scope: str) -> bool:
     return any(scope == root or scope.startswith(f"{root}.") for root in _FORBIDDEN_SCOPE_ROOTS)
+
+
+def _is_core_name(name: str) -> bool:
+    return name.partition(".")[0] in _CORE_NAMESPACES
+
+
+def _type_key(node: Any) -> str | None:
+    info = getattr(type(node), "__tvm_ffi_type_info__", None)
+    return getattr(info, "type_key", None)
 
 
 def _node_name(node: Any) -> str:
@@ -57,6 +74,7 @@ class LowLevelIRFinding:
     scope: str | None
     callee: str | None
     span: str | None
+    type_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -93,10 +111,14 @@ class LowLevelIRReport:
         for finding in self.violations:
             scope = f", scope={finding.scope}" if finding.scope is not None else ""
             callee = f", callee={finding.callee}" if finding.callee is not None else ""
+            type_key = f", type_key={finding.type_key}" if finding.type_key is not None else ""
             span = f", span={finding.span}" if finding.span is not None else ""
             lines.append(
-                f"- {finding.function}: {finding.kind} ({finding.node_type}{scope}{callee}{span})"
+                f"- {finding.function}: {finding.kind} "
+                f"({finding.node_type}{scope}{callee}{type_key}{span})"
             )
+        if any(finding.kind.startswith("extension_") for finding in self.violations):
+            lines.append(f"hint: {_EXTENSION_HINT}")
         return "\n".join(lines)
 
 
@@ -119,26 +141,49 @@ class _LowLevelIRInspector:
         self.address_only_loads: list[LowLevelIRFinding] = []
         self.setmaxnreg_calls: list[LowLevelIRFinding] = []
         self.has_min_blocks_per_sm = False
+        self._extension_types: set[tuple[str, str | None]] = set()
 
-    def __call__(self, body: tvm_tirx.ir.Stmt) -> None:
+    def __call__(self, func: tirx.Function) -> None:
+        # Parameters can only introduce types; the body is where every other check applies.
+        for param in func.params:
+            structural_visit(param, [(tvm_tirx.ir.Type, self._visit_type)])
         structural_visit(
-            body,
+            func.body,
             [
                 (tvm_tirx.ir.TensorLoad, self._visit_load),
                 (tvm_tirx.ir.TensorStore, self._visit_store),
                 (tvm_tirx.ir.Call, self._visit_call),
                 (tvm_tirx.ir.RegionStmt, self._visit_region),
+                (tvm_tirx.ir.Type, self._visit_type),
             ],
         )
 
     def _visit_region(self, op, visitor):
+        op_name = op.op.name
+        if not _is_core_name(op_name):
+            self.violations.append(self._finding(op, "extension_region", callee=op_name))
         kernel_attrs = op.attrs.get("cuda.kernel_attrs", {})
         if kernel_attrs.get("min_blocks_per_sm", 0):
             self.has_min_blocks_per_sm = True
         visitor.default_visit(op)
 
+    def _visit_type(self, ty: tvm_tirx.ir.Type, visitor: Any) -> None:
+        key = _type_key(ty)
+        if key is not None and not _is_core_name(key):
+            finding = self._finding(ty, "extension_type", type_key=key)
+            # A type recurs on every value that carries it; report it once per location.
+            if (key, finding.span) not in self._extension_types:
+                self._extension_types.add((key, finding.span))
+                self.violations.append(finding)
+        visitor.default_visit(ty)
+
     def _finding(
-        self, node: Any, kind: str, scope: str | None = None, callee: str | None = None
+        self,
+        node: Any,
+        kind: str,
+        scope: str | None = None,
+        callee: str | None = None,
+        type_key: str | None = None,
     ) -> LowLevelIRFinding:
         return LowLevelIRFinding(
             function=self.function,
@@ -147,6 +192,7 @@ class _LowLevelIRInspector:
             scope=scope,
             callee=callee,
             span=_span_text(node),
+            type_key=type_key,
         )
 
     def _visit_load(self, op: tvm_tirx.ir.TensorLoad, visitor: Any) -> None:
@@ -166,6 +212,8 @@ class _LowLevelIRInspector:
 
     def _visit_call(self, op: tvm_tirx.ir.Call, visitor: Any) -> None:
         op_name = getattr(op.op, "name", None)
+        if isinstance(op.op, tvm_tirx.ir.Op) and not _is_core_name(op_name):
+            self.violations.append(self._finding(op, "extension_call", callee=op_name))
         if (
             isinstance(op.op, tvm_tirx.ir.Op)
             and op.op.has_attr("FTileOpDispatch")
@@ -240,6 +288,11 @@ def inspect_low_level_ir(
     ``value`` may be a TIRx ``Function``, ``IRModule``, or nested list, tuple,
     or mapping containing those objects.  Direct ``tirx.address_of`` operands
     are reported separately and do not count as memory reads.
+
+    Calls, region statements and types registered outside the core ``ir``,
+    ``prim`` and ``tirx`` namespaces are IR-extension constructs. codegen and
+    the analysis tools cannot handle them, so they are violations until the
+    extension's lowering pass has replaced them with core IR.
     """
     checked_functions: list[str] = []
     violations: list[LowLevelIRFinding] = []
@@ -250,7 +303,7 @@ def inspect_low_level_ir(
     for path, prim_func in _iter_functions(value):
         checked_functions.append(path)
         visitor = _LowLevelIRInspector(path, allowed_func_calls)
-        visitor(prim_func.body)
+        visitor(prim_func)
         if visitor.setmaxnreg_calls and not visitor.has_min_blocks_per_sm:
             visitor.violations.extend(visitor.setmaxnreg_calls)
         violations.extend(visitor.violations)

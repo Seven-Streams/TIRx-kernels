@@ -129,10 +129,16 @@ class Session:
 
 
 class Kernel:
-    """The traced kernel: a ``Function`` plus the launch metadata."""
+    """The traced kernel: a ``Function`` plus the launch metadata.
 
-    def __init__(self, func, session):
+    ``func`` is the function the checkers, ``compile()`` and the benchmark
+    consume: the kernel after its lowering passes. ``traced_func`` is the kernel
+    as written; the two are the same object when the kernel has no passes.
+    """
+
+    def __init__(self, func, session, traced_func=None):
         self.func = func
+        self.traced_func = func if traced_func is None else traced_func
         self.session = session
         self.name = session.name
         self.warps = session.warps
@@ -264,12 +270,65 @@ def device_entry(*, launch, kernel_attrs=None, backend_config=None):
     return _DeviceEntry(context, launch, kernel_attrs, backend_config)
 
 
-def kernel(*, allowed_func_calls: tuple[str, ...] = (), check_ir: bool = True, **obsolete):
+def _pass_name(pass_) -> str:
+    info = getattr(pass_, "info", None)
+    return str(getattr(info, "name", None) or getattr(pass_, "__name__", None) or pass_)
+
+
+def _apply_lowering_pass(pass_, func):
+    """Run one ``Function -> Function`` callable or ``tvm_tirx`` pass on ``func``."""
+    try:
+        if isinstance(pass_, tvm_tirx.ir.transform.Pass):
+            result = pass_(tvm_tirx.IRModule({"main": func}))["main"]
+        else:
+            result = pass_(func)
+    except Exception as error:
+        if hasattr(error, "add_note"):
+            error.add_note(f"[txl.kernel] raised inside lowering pass {_pass_name(pass_)!r}")
+        raise
+    if not isinstance(result, tvm_tirx.tirx.Function):
+        raise TypeError(
+            f"lowering pass {_pass_name(pass_)!r} must return the rewritten "
+            f"tvm_tirx.tirx.Function, got {type(result).__name__}"
+        )
+    return result
+
+
+def _run_lowering_passes(func, passes, session):
+    """Apply ``passes`` in order with the kernel's session current.
+
+    The session makes the coordinate helpers (``txl.lane_id()`` and friends)
+    resolve to the kernel's bound variables, so a pass can macro-expand its
+    replacement with the ordinary builders under its own ``IRBuilder``.
+    """
+    previous_trace = getattr(_TLS, "trace", None)
+    previous_session = getattr(_TLS, "session", None)
+    _TLS.trace = None
+    _TLS.session = session
+    try:
+        for pass_ in passes:
+            func = _apply_lowering_pass(pass_, func)
+    finally:
+        _TLS.trace = previous_trace
+        _TLS.session = previous_session
+    return func
+
+
+def kernel(
+    *, passes=(), allowed_func_calls: tuple[str, ...] = (), check_ir: bool = True, **obsolete
+):
     """Trace a host function containing one explicit ``txl.device_entry``.
 
     Annotations bind the host entry's ABI. The function prepares host values
     and declares its launch configuration in the body, using those parameters
     directly. Only values used by the device body become device parameters.
+
+    ``passes`` lowers a kernel written with IR extensions (operators, region
+    operators or types registered outside the core namespaces) to core IR. Each
+    entry is a ``Function -> Function`` callable or a ``tvm_tirx`` pass; they run
+    once, in order, after tracing and before the low-level IR contract check,
+    with the kernel's session current. The returned ``Kernel.func`` is the
+    lowered function and ``Kernel.traced_func`` the kernel as written.
     """
 
     if obsolete:
@@ -277,6 +336,10 @@ def kernel(*, allowed_func_calls: tuple[str, ...] = (), check_ir: bool = True, *
             f"Unsupported txl.kernel options {tuple(obsolete)}; set BackendConfig on "
             "the compile Target or device_entry(backend_config=...)"
         )
+    passes = (passes,) if callable(passes) else tuple(passes)
+    for pass_ in passes:
+        if not callable(pass_):
+            raise TypeError(f"a lowering pass must be callable, got {type(pass_).__name__}")
 
     def decorator(fn):
         sig = inspect.signature(fn)
@@ -327,11 +390,14 @@ def kernel(*, allowed_func_calls: tuple[str, ...] = (), check_ir: bool = True, *
         if session.specialize is not None:
             # Keep adjacent role guards mutually exclusive after tracing.
             func = session.specialize.chain_dispatch(func)
+        traced_func = func
+        if passes:
+            func = _run_lowering_passes(func, passes, session)
         if check_ir:
             from .low_level_ir import check_low_level_ir
 
             check_low_level_ir(func, allowed_func_calls=allowed_func_calls)
-        return Kernel(func, session)
+        return Kernel(func, session, traced_func=traced_func)
 
     return decorator
 

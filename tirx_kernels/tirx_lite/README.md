@@ -20,7 +20,9 @@ def zero(out: txl.Tensor((txl.int64(),), "float32")):
 - `zero.func`: the pre-lowering TIRx `Function` used by analysis tools and
   package runners;
 - `zero.mod`: an `IRModule` containing that function;
-- `zero.compile()`: a runnable module compiled through the TIRx pipeline.
+- `zero.compile()`: a runnable module compiled through the TIRx pipeline;
+- `zero.traced_func`: the kernel as written. It differs from `zero.func` only
+  when the decorator runs lowering `passes`.
 
 ## Authoring contract
 
@@ -43,6 +45,13 @@ def zero(out: txl.Tensor((txl.int64(),), "float32")):
 - Every kernel is checked against the low-level IR contract when it is traced.
   Keep the default `check_ir=True`. `allowed_func_calls` is only for a task that
   explicitly owns a named runtime-call exception.
+- Operators, region operators and types registered outside the core `ir`,
+  `prim` and `tirx` namespaces are IR extensions. Codegen and the analysis tools
+  do not know them, so the contract rejects them. A kernel written with an
+  extension passes its lowering as `@txl.kernel(passes=[...])`: each pass is a
+  `Function -> Function` callable or a `tvm_tirx` pass, and they run once, in
+  order, after tracing and before the contract check. The kernel's session is
+  current inside a pass, so `txl.lane_id()` and the other builders work there.
 - Statements and instruction calls traced from file-backed Python code carry
   TIRx source spans pointing to the kernel or helper line that emitted them;
   the resulting `Function` points to the `@txl.kernel` declaration.
@@ -154,7 +163,7 @@ used only by launch configuration remain host arguments; only device-body
 dependencies become GPU kernel parameters. The external call signature stays
 the same when the grid changes between invocations.
 
-The decorator accepts `allowed_func_calls` and `check_ir`. It no longer
+The decorator accepts `passes`, `allowed_func_calls` and `check_ir`. It no longer
 accepts launch configuration or host preparation callbacks, and `host` is not a
 special injected parameter. Move former launch factories into `device_entry`
 and call preparation helpers directly from the function body.
